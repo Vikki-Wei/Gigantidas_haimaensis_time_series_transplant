@@ -1,1 +1,243 @@
+#trim illumina reads with Trimmomatic-0.39
+java -jar /scratch/PI/boqianpy/App/Trimmomatic-0.39/trimmomatic-0.39.jar PE -threads 40 -phred33 ../*_1.clean.fq.gz ../*_2.clean.fq.gz BMH_trans*_1.gill_1P.fq BMH_trans*_1.gill_1U.fq BMH_trans*_1.gill_2P.fq BMH_trans*_1.gill_2U.fq ILLUMINACLIP:adapter.fa:2:30:10 LEADING:30 TRAILING:30 SLIDINGWINDOW:4:30 MINLEN:10
 
+#remove rRNA contaminants in meta-transcriptome reads by SortMeRNA
+sortmerna --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/rfam-5.8s-database-id98.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/rfam-5s-database-id98.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-arc-16s-id95.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-arc-23s-id98.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-bac-16s-id90.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-bac-23s-id98.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-euk-18s-id95.fasta --ref /scratch/PI/boqianpy/Database/rRNA_databases_v4.3.6/silva-euk-28s-id98.fasta --reads /home/tweiac/link/bathymodiolushaimaensis/2022-meta-transcriptome/trim/BMH_*.gill_1P.fq --reads /home/tweiac/link/bathymodiolushaimaensis/2022-meta-transcriptome/trim/BMH_*.gill_2P.fq ---threads 40 -m 1600000000 --fastx --aligned BMH_*_rRNA --other BMH_*_non_rRNA --paired_in -v --out2
+
+#Mitochondrial genomes assemly with MitoFinder v1.4.2
+mitofinder -j Gh4_6h -1 ../BMH_*_non_rRNA_fwd.fq -2 ../BMH_*_non_rRNA_rev.fq -r ref.Gh.mito.gb -o 5 -p 40 -m 256
+
+#using salmon v1.10.1 to quantify the gene expression
+salmon index -t all_transcript.fa -i all_transcript
+salmon quant -i all_transcript -l IU -1 ../BMH_*_non_rRNA_fwd.fq -2 ../BMH_*_non_rRNA_rev.fq --seqBias -o all1_*_salmon
+
+#estimate abundance matrix using abundance_estimates_to_matrix.pl
+perl /home/tweiac/linkapp/trinityrnaseq-v2.13.2/util/abundance_estimates_to_matrix.pl --est_method salmon --gene_trans_map none --out_prefix BMH_timeseries BMH*.quant.txt
+perl /home/tweiac/linkapp/trinityrnaseq-v2.13.2/util/abundance_estimates_to_matrix.pl --est_method salmon --gene_trans_map none --out_prefix MOB_timeseries MOB*.quant.txt
+perl /home/tweiac/linkapp/trinityrnaseq-v2.13.2/util/abundance_estimates_to_matrix.pl --est_method salmon --gene_trans_map none --out_prefix EPI_timeseries EPI*.quant.txt
+
+#WGCNA R scripts
+install.packages('BiocManager')
+BiocManager::install("WGCNA")
+library(WGCNA)
+install.packages(c("matrixStats","Hmisc","splines","foreach","doParallel","fastcluster","dynamicTreeCut","survival","BiocManager"))
+BiocManager::install(c("GO.db","preprocessCore","impute"))
+BiocManager::install("dplyr")
+library(dplyr)
+install.packages("RColorBrewer")
+library(RColorBrewer)
+
+#Import data (gene expression matrixs)
+gene <- read.delim('D:/p2/WGCNA-rm6h_4/all/GH_TPM_rm6h_4.txt', row.names = 1, check.names = FALSE)
+gene <- subset(gene, rowSums(gene)/ncol(gene) >= 1)
+gene <- t(gene)
+
+#Scale-free Topological Analysis to Determine the Optimal β Value
+##Determine power value
+powers <- 1:20
+sft <- pickSoftThreshold(gene, powerVector = powers, verbose = 5)
+
+#Scatter Plot of the Fit Index and Power Values
+par(mfrow = c(1, 2))
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], type = 'n', 
+     xlab = 'Soft Threshold (power)', ylab = 'Scale Free Topology Model Fit,signed R^2', 
+     main = paste('Scale independence'))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels = powers, col = 'red');
+abline(h = 0.85, col = 'red')
+
+#Scatter Plot of Average Connectivity and Power Values
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab = 'Soft Threshold (power)', ylab = 'Mean Connectivity', type = 'n',
+     main = paste('Mean connectivity'))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels = powers, col = 'red')
+
+pickSoftThreshold(gene)
+
+#Obtain the gene co-expression similarity matrix
+#The best estimate of the power value from the previous step
+powers <- sft$powerEstimate
+
+#Obtain TOM matrix
+adjacency <- adjacency(gene, power = powers)
+tom_sim <- TOMsimilarity(adjacency)
+rownames(tom_sim) <- rownames(adjacency)
+colnames(tom_sim) <- colnames(adjacency)
+tom_sim[1:6,1:6]
+
+#Output TOM matrix
+write.table(tom_sim, 'D:/p2/WGCNA-rm6h_4/all/R/GH/GH_TOMsimilarity.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+
+#Identification of Co-Expressed Modules
+#TOM Divergence = 1 – TOM Similarity
+tom_dis  <- 1 - tom_sim
+
+#Hierarchical clustering tree using average-aggregation clustering with the median unweighted pairwise method
+geneTree <- hclust(as.dist(tom_dis), method = 'average')
+plot(geneTree, xlab = '', sub = '', main = 'Gene clustering on TOM-based dissimilarity',
+     labels = FALSE, hang = 0.04)
+
+#Using the Dynamic Shear Tree Mining Module
+minModuleSize <- 30  #module gene number
+dynamicMods <- cutreeDynamic(dendro = geneTree, distM = tom_dis,
+                             deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = minModuleSize)
+
+table(dynamicMods)
+
+dynamicColors <- labels2colors(dynamicMods)
+table(dynamicColors)
+
+
+plotDendroAndColors(geneTree, dynamicColors, 'Dynamic Tree Cut',
+                    dendroLabels = FALSE, addGuide = TRUE, hang = 0.03, guideHang = 0.05,
+                    main = 'Gene dendrogram and module colors')
+
+
+#Gene Expression Clustering Tree and Co-expression Topological Heatmap
+plot_sim <- -(1-tom_sim)
+#plot_sim <- log(tom_sim)
+diag(plot_sim) <- NA
+TOMplot(plot_sim, geneTree, dynamicColors,
+        main = 'Network heatmap plot, selected genes')
+
+#Calculation of Module-Specific Genes
+#Calculating the characteristic genes (first principal component) of modules in a gene expression matrix
+MEList <- moduleEigengenes(gene, colors = dynamicColors)
+MEs <- MEList$eigengenes
+head(MEs)[1:6]
+
+#Output Module Feature Gene Matrix
+write.table(MEs, 'D:/p2/WGCNA-rm6h_4/all/R/GH/GH_moduleEigengenes.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+#Further Clustering of Co-expression Modules
+#Calculating inter-module correlations based on module-specific genes to characterize the similarity between modules
+ME_cor <- cor(MEs)
+ME_cor[1:6,1:6]
+
+#Plotting a Clustering Tree for Observation
+METree <- hclust(as.dist(1-ME_cor), method = 'average')
+plot(METree, main = 'Clustering of module eigengenes', xlab = '', sub = '')
+
+# Exploratory analysis to observe similarities among modules
+# The “height” value can represent the degree of dissimilarity among modules, and a suitable threshold can be determined as the cutoff height
+# to provide a basis for merging modules with low dissimilarity (high similarity
+abline(h = 0.25, col = 'red')
+
+#Heatmap of Gene Clustering Trees by Module Features
+plotEigengeneNetworks(MEs, '', cex.lab = 0.8, xLabelsAngle= 90,
+                      marDendro = c(0, 4, 1, 2), marHeatmap = c(3, 4, 1, 2))
+
+
+# Merge similar modules, using 0.25 as the merge threshold (clipping height); modules at or below this height will be merged
+# Roughly speaking, modules with a correlation coefficient higher than 0.75 will be merged together
+merge_module <- mergeCloseModules(gene, dynamicColors, cutHeight = 0.25, verbose = 3)
+mergedColors <- merge_module$colors
+table(mergedColors)
+
+#Gene Expression and Module Clustering Tree
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), c('Dynamic Tree Cut', 'Merged dynamic'),
+                    dendroLabels = FALSE, addGuide = TRUE, hang = 0.03, guideHang = 0.05)
+#Gene Expression and Module Clustering Tree (merged only)
+plotDendroAndColors(geneTree, cbind(mergedColors), c('Merged dynamic'),
+                    dendroLabels = FALSE, addGuide = TRUE, hang = 0.03, guideHang = 0.05)
+
+#Outputs lists of edges and nodes for each module's subnetwork, which can later be imported into Cytoscape to generate a network diagram
+#The weights of the edges are the values from the TOM matrix, which record the co-expression similarity between genes
+dir.create('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape', recursive = TRUE)
+
+for (mod in 1:nrow(table(mergedColors))) {
+  modules <- names(table(mergedColors))[mod]
+  probes <- colnames(gene)
+  inModule <- (mergedColors == modules)
+  modProbes <- probes[inModule]
+  modGenes <- modProbes
+  modtom_sim <- tom_sim[inModule, inModule]
+  dimnames(modtom_sim) <- list(modProbes, modProbes)
+  outEdge <- paste('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape/', modules, '.merged.edge_list.txt',sep = '')
+  outNode <- paste('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape/', modules, '.merged.node_list.txt', sep = '')
+  exportNetworkToCytoscape(modtom_sim,
+                           edgeFile = outEdge,
+                           nodeFile = outNode,
+                           weighted = TRUE,
+                           threshold = 0,
+                           nodeNames = modProbes,
+                           altNodeNames = modGenes,
+                           nodeAttr = mergedColors[inModule])
+}
+
+
+#non merged
+dir.create('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape/non-merged', recursive = TRUE)
+for (mod in 1:nrow(table(dynamicColors))) {
+  dynamics <- names(table(dynamicColors))[mod]
+  probes <- colnames(gene)
+  inModule <- (dynamicColors == dynamics)
+  modProbes <- probes[inModule]
+  modGenes <- modProbes
+  modtom_sim <- tom_sim[inModule, inModule]
+  dimnames(modtom_sim) <- list(modProbes, modProbes)
+  outEdge <- paste('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape/non-merged', dynamics, '.edge_list.txt',sep = '')
+  outNode <- paste('D:/p2/WGCNA-rm6h_4/all/R/GH/cytoscape/non-merged', dynamics, '.node_list.txt', sep = '')
+  exportNetworkToCytoscape(modtom_sim,
+                           edgeFile = outEdge,
+                           nodeFile = outNode,
+                           weighted = TRUE,
+                           threshold = 0.3,  #This parameter controls the number of edges in the output and filters out edges with low weights.
+                           nodeNames = modProbes,
+                           altNodeNames = modGenes,
+                           nodeAttr = dynamicColors[inModule])
+}
+
+#Phenotypic Data
+trait <- read.delim('D:/p2/WGCNA-rm6h_4/all/R/GH/trait.txt', row.names = 1, check.names = FALSE)
+
+##1. Use the results from the co-expression modules that have not been merged
+
+#Analysis of the Correlation Between Gene Co-expression Modules and Phenotypes
+moduleTraitCor <- cor(MEs, trait, use = 'p')
+moduleTraitCor[1:2,1:2]  
+
+#Matrix of p-values for correlation coefficients
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(MEs))
+
+#Output the correlation coefficient matrix or the p-value matrix
+write.table(moduleTraitCor, 'D:/p2/WGCNA-rm6h_4/all/R/GH/1_moduleTraitCor.txt', sep = '\t', col.names = NA, quote = FALSE)
+write.table(moduleTraitPvalue, 'D:/p2/WGCNA-rm6h_4/all/R/GH/1_moduleTraitPvalue.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+#Drawing Related Diagrams
+
+textMatrix <- paste(signif(moduleTraitCor, 2), '(', signif(moduleTraitPvalue, 1), ')', sep = '')
+dim(textMatrix) <- dim(moduleTraitCor)
+
+par(mar = c(5, 10, 3, 3))
+labeledHeatmap(Matrix = moduleTraitCor, main = paste('Module-trait relationships'),
+               xLabels = names(trait), yLabels = names(MEs), ySymbols = names(MEs),
+               colorLabels = FALSE, colors = blueWhiteRed(50), cex.text = 0.7, zlim = c(-1,1),
+               textMatrix = textMatrix, setStdMargins = FALSE)
+
+
+#2. Use the results from the co-expression modules that have been merged
+module <- merge_module$newMEs
+
+#Analysis of the Correlation Between Gene Co-expression Modules and Phenotypes
+moduleTraitCor <- cor(module, trait, use = 'p')
+moduleTraitCor[1:2,1:2] 
+
+#Matrix of p-values for correlation coefficients
+moduleTraitPvalue <- corPvalueStudent(moduleTraitCor, nrow(module))
+
+#Output the correlation coefficient matrix or the p-value matrix
+write.table(moduleTraitCor, 'D:/p2/WGCNA-rm6h_4/all/R/GH/moduleTraitCor.txt', sep = '\t', col.names = NA, quote = FALSE)
+write.table(moduleTraitPvalue, 'D:/p2/WGCNA-rm6h_4/all/R/GH/moduleTraitPvalue.txt', sep = '\t', col.names = NA, quote = FALSE)
+
+#Drawing Related Diagrams
+
+textMatrix <- paste(signif(moduleTraitCor, 2), '(', signif(moduleTraitPvalue, 1), ')', sep = '')
+dim(textMatrix) <- dim(moduleTraitCor)
+
+par(mar = c(5, 10, 3, 3))
+labeledHeatmap(Matrix = moduleTraitCor, main = paste('Module-trait relationships'),
+               xLabels = names(trait), yLabels = names(module), ySymbols = names(module),
+               colorLabels = FALSE, colors = blueWhiteRed(50), cex.text = 0.7, zlim = c(-1,1),
+               textMatrix = textMatrix, setStdMargins = FALSE)
